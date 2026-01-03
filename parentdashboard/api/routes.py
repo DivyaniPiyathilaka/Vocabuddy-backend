@@ -105,8 +105,8 @@ def process_pdf_background(filename: str):
 
 @router.post("/pdfs/upload")
 async def upload_pdf(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
 ):
     """
     Upload a PDF file to the knowledge base.
