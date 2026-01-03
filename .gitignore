@@ -31,6 +31,10 @@ ENV/
 # Chroma DB
 chroma_db/
 
+data/
+run_therapy_only.py
+
+
 # IDE
 .vscode/
 .idea/
