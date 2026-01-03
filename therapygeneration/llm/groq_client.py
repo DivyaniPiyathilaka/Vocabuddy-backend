@@ -14,7 +14,7 @@ class GroqClient:
 
     def __init__(self, model: str = "moonshotai/kimi-k2-instruct-0905"):
         api_key = os.getenv("GROQ_API_KEY")
-        
+
         if not api_key:
             raise RuntimeError("GROQ_API_KEY is not set in environment variables.")
         self.client = Groq(api_key=api_key)
