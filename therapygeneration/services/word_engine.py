@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from therapygeneration.repository.word_engine import WordRepository
 from therapygeneration.domain.level_rules import get_constraints
@@ -10,12 +10,9 @@ class PracticeService:
     def __init__(self):
         self.repo = WordRepository()
 
-    # Keep this if your UI currently calls create_activity
     def create_activity(self, child_id: str, letter: str, mode: str, level: int, count: int) -> Dict:
-        # For now, create_activity can just call preview_activity and return that.
         return self.preview_activity(child_id=child_id, letter=letter, mode=mode, level=level, count=count)
 
-    # Step 3 (already working): deterministic preview + missing_count
     def preview_activity(self, child_id: str, letter: str, mode: str, level: int, count: int) -> Dict:
         constraints = get_constraints(level)
         difficulty_to_use = constraints.difficulty_range[1]
@@ -49,7 +46,6 @@ class PracticeService:
             "can_generate": missing_count > 0
         }
 
-    # Step 4: Groq suggest-only + deterministic validation + PIN gate
     def generate_suggestions(
         self,
         *,
@@ -66,10 +62,8 @@ class PracticeService:
             return {"ok": False, "error": "Invalid therapist PIN."}
 
         constraints = get_constraints(level)
-
         groq = GroqClient(model=model)
 
-        # oversample so therapist has options; validator will reject bad ones
         want = max(oversample, missing_count)
 
         raw_candidates = groq.suggest_words(
@@ -79,14 +73,15 @@ class PracticeService:
             max_len=constraints.max_length
         )
 
-        # For now we only check duplicates inside suggestions.
-        # In Step 5 we will also block "already exists in DB".
+        #Block duplicates that already exist in DB
+        existing_norm = self.repo.get_all_words_normalized()
+
         results = validate_candidate_list(
             raw_candidates,
             letter=letter,
             mode=mode,
             max_len=constraints.max_length,
-            existing_words_normalized=None
+            existing_words_normalized=existing_norm
         )
 
         return {
@@ -106,4 +101,78 @@ class PracticeService:
                 }
                 for r in results
             ]
+        }
+
+    #Step 5: therapist approves selected words -> insert into DB
+    def approve_words(
+        self,
+        *,
+        therapist_pin: str,
+        child_id: str,
+        letter: str,
+        mode: str,
+        level: int,
+        requested_count: int,
+        approved_words: List[str],
+        difficulty_mode: str = "auto",     # "auto" or "manual"
+        manual_difficulty: int = 1,
+        tag_value: str = "unclassified"    # simple now
+    ) -> Dict:
+        if therapist_pin != "1234":
+            return {"ok": False, "error": "Invalid therapist PIN."}
+
+        constraints = get_constraints(level)
+
+        # Existing DB words to prevent duplicates
+        existing_norm = self.repo.get_all_words_normalized()
+
+        # Re-validate therapist selected words deterministically
+        results = validate_candidate_list(
+            approved_words,
+            letter=letter,
+            mode=mode,
+            max_len=constraints.max_length,
+            existing_words_normalized=existing_norm
+        )
+
+        valid_selected = [r.normalized for r in results if r.valid and r.normalized]
+        invalid_selected = [{"word": r.word, "reasons": r.reasons} for r in results if not r.valid]
+
+        # Difficulty assignment (simple + controllable)
+        if difficulty_mode == "auto":
+            difficulty_to_store = constraints.difficulty_range[1]
+        else:
+            difficulty_to_store = int(manual_difficulty)
+
+        inserted: List[str] = []
+        skipped_existing: List[str] = []
+
+        for w in valid_selected:
+            ok = self.repo.insert_word(
+                word_si=w,
+                difficulty=difficulty_to_store,
+                tags=tag_value,
+                source="llm_approved",
+                approved_by="therapist_demo",
+            )
+            if ok:
+                inserted.append(w)
+            else:
+                skipped_existing.append(w)
+
+        # Return updated preview for the original requested_count
+        updated = self.preview_activity(
+            child_id=child_id,
+            letter=letter,
+            mode=mode,
+            level=level,
+            count=requested_count
+        )
+
+        return {
+            "ok": True,
+            "inserted": inserted,
+            "skipped_existing": skipped_existing,
+            "invalid_selected": invalid_selected,
+            "updated_preview": updated
         }
