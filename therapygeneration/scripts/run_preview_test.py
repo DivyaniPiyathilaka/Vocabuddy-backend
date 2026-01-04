@@ -8,7 +8,7 @@ result = service.preview_activity(
     letter="ස",
     mode="starts_with",
     level=3,
-    count=5
+    count=10
 )
 
 print(result)
