@@ -1,6 +1,7 @@
 """
 FastAPI main entry point for Parent Dashboard backend.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +10,18 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).parent.absolute()
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+
+# ---- LOAD .env EARLY (before importing anything that reads env vars) ----
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=BACKEND_DIR / ".env", override=False)
+except Exception as e:
+    # Don't crash if dotenv isn't installed, but warn clearly.
+    print(f"[WARN] Could not load .env: {e}")
+
+# Optional: quick sanity check (remove after confirming it works)
+if not os.getenv("GROQ_API_KEY"):
+    print("[WARN] GROQ_API_KEY is not set. Check your .env location and format.")
 
 from fastapi import FastAPI
 from fastapi.responses import Response

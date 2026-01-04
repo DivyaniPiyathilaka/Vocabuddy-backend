@@ -4,6 +4,18 @@ from typing import List, Dict, Any
 
 from groq import Groq
 
+# Load .env automatically (works no matter how you run the project)
+try:
+    from dotenv import load_dotenv
+    from pathlib import Path
+
+    # Project root = folder that contains main.py and .env
+    ROOT = Path(__file__).resolve().parents[2]  # therapygeneration/llm -> project root
+    load_dotenv(dotenv_path=ROOT / ".env", override=False)
+except Exception:
+    # If python-dotenv not installed or .env missing, just continue
+    pass
+
 
 class GroqClient:
     """
