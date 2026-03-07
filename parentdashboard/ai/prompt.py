@@ -23,18 +23,13 @@ def detect_language(text: str) -> str:
 
 def get_general_knowledge_warning(language: str) -> str:
     """
-    Get the warning message for general knowledge usage.
-    
-    Args:
-        language: 'sinhala' or 'english'
-    
-    Returns:
-        Warning message in the specified language
+    Deprecated: previously returned a medical-warning footer.
+
+    Now returns an empty string; the assistant should still be clear
+    when it is using general guidance vs. PDF-derived information,
+    but without appending a fixed warning message.
     """
-    if language == 'sinhala':
-        return "මෙම පිළිතුර සම්පූර්ණ වශයෙන් වෛද්‍ය උපදෙස් ලෙස සලකන්න එපා."
-    else:
-        return "This answer is not from the PDF sources and should not be considered medical advice."
+    return ""
 
 
 def build_prompt(query: str, context_chunks: List[Dict]) -> str:
@@ -66,22 +61,17 @@ def build_prompt(query: str, context_chunks: List[Dict]) -> str:
     else:
         context_text = "\n\n[No relevant context found in the knowledge base]"
     
-    # Get warning message in appropriate language
-    warning_message = get_general_knowledge_warning(query_language)
-    
     # Determine answer strategy based on context availability
     if has_context:
         answer_strategy = f"""ANSWER STRATEGY:
 1. PRIMARY: Use the information from the PDF context above as your main source.
 2. SUPPLEMENT: If the PDF context doesn't fully answer the question, you may supplement with general knowledge about speech therapy, but you MUST clearly indicate what comes from the PDFs vs. general knowledge.
 3. ACCURACY: Prioritize accuracy from PDFs, but you don't need a 100% exact match - use your understanding to provide helpful answers.
-4. GENERAL KNOWLEDGE WARNING: If you use any general knowledge (not from PDFs), you MUST include this warning at the end of your response: "{warning_message}"
-5. If the question is completely unrelated to the PDF context, you may use general knowledge, but you MUST include the warning message."""
+4. If the question is completely unrelated to the PDF context, you may use general knowledge, but make it clear when your answer is based on general guidance rather than the PDFs."""
     else:
         answer_strategy = f"""ANSWER STRATEGY:
 1. Since no relevant context was found in the PDFs, you may use general knowledge about speech therapy, phonological issues, and child speech development.
-2. You MUST include this warning at the end of your response: "{warning_message}"
-3. Still provide helpful, accurate information in simple language, but make it clear this is general guidance only."""
+2. Still provide helpful, accurate information in simple language, but make it clear this is general guidance only."""
     
     prompt = f"""You are a helpful and supportive AI assistant for parents whose children are undergoing speech therapy. Your role is to provide clear, simple, and encouraging guidance about phonological issues, speech therapy, and child speech development.
 
@@ -122,8 +112,6 @@ CRITICAL FOR SINHALA RESPONSES:
 - If you need to explain a concept, use simple examples or comparisons
 
 Prioritize information from the PDFs, but supplement with general knowledge when needed to fully answer the question.
-
-CRITICAL: If you use ANY general knowledge (information not found in the PDF context above), you MUST end your response with this warning: "{warning_message}"
 """
     
     return prompt
@@ -136,7 +124,7 @@ def get_system_prompt() -> str:
     Returns:
         System prompt string
     """
-    return """You are a helpful and supportive AI assistant for parents whose children are undergoing speech therapy. Your role is to provide clear, simple, and encouraging guidance about phonological issues, speech therapy, and child speech development.
+    return """You are an expert Speech-Language Pathologist and a helpful, supportive AI assistant for parents whose children are undergoing speech therapy. Your role is to provide clear, simple, and encouraging guidance about phonological issues, speech therapy, and child speech development.
 
 Key principles:
 - Respond in the same language as the user's question (Sinhala or English)
@@ -149,7 +137,9 @@ Key principles:
 - Use simple, parent-friendly language - avoid medical jargon in any language
 - Be supportive, calm, and encouraging
 - Focus on phonological issues, speech therapy, and child speech development
-- Use PDF materials as primary source, supplement with general knowledge when needed
+- Use PDF materials as primary source for technical definitions and background information, supplement with general knowledge when needed
 - Maintain high accuracy from PDFs, but provide helpful answers even without 100% exact match
-- CRITICAL: If using general knowledge, you MUST include the warning message that it's not from PDF sources and should not be considered medical advice"""
+- PERSONALIZATION: When a 'Child Summary' is provided, use it to tailor your advice to that specific child's progress and difficulties.
+- When the question is about the child's activities, progress, or performance: answer from the Child Summary data only. Do NOT say that this data is not in the PDFs—just explain the answer using the child's data.
+- If the question is general (not about a specific child), rely mainly on PDFs and general knowledge, and only then mention when something is not from PDF sources."""
 

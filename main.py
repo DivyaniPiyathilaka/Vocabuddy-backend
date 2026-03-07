@@ -26,7 +26,7 @@ if not os.getenv("GROQ_API_KEY"):
 from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-# from parentdashboard.api.routes import router as parent_router
+from parentdashboard.api.routes import router as parent_router
 from therapygeneration.api.routes import router as therapy_router
 
 # Initialize FastAPI app
@@ -46,7 +46,7 @@ app.add_middleware(
 )
 
 # Include routers
-# app.include_router(parent_router)
+app.include_router(parent_router)
 app.include_router(therapy_router)
 
 

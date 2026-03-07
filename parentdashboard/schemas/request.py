@@ -7,11 +7,16 @@ from pydantic import BaseModel, Field
 class QuestionRequest(BaseModel):
     """Request model for asking a question."""
     question: str = Field(..., description="The parent's question", min_length=1, max_length=1000)
+    child_id: str | None = Field(
+        default=None,
+        description="Optional child identifier for personalized answers",
+    )
     
     class Config:
         json_schema_extra = {
             "example": {
-                "question": "How can I help my child with R sounds?"
+                "question": "How can I help my child with R sounds?",
+                "child_id": "sUXK8GwJC6QNPQ7PCxSXEzT3TH63",
             }
         }
 

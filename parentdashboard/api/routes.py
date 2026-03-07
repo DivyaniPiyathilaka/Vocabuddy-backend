@@ -3,20 +3,37 @@ API routes for Parent Dashboard.
 """
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 import os
 import shutil
 from parentdashboard.schemas.request import QuestionRequest, UpdatePdfRequest
 from parentdashboard.schemas.response import AnswerResponse
+from parentdashboard.schemas.speech_stats import (
+    SpeechStatsResponse,
+    ChildSummaryResponse,
+)
 from parentdashboard.services.qa_service import QAService
+from parentdashboard.services.service import (
+    FirestoreSpeechRepository,
+    SpeechStatsService,
+    get_dashboard_stats,
+    _resolve_child_uid,
+    LOGGED_IN_USER_UID,
+    get_accuracy_from_latest_practice_per_session,
+    get_monthly_practice_count,
+    get_target_sounds_last_4_sessions,
+    get_best_and_focus_session_letters,
+)
 from parentdashboard.config import PDFS_DIR
 
 # Initialize router
 router = APIRouter(prefix="/parentdashboard", tags=["Parent Dashboard"])
 
-# Initialize QA service (singleton pattern)
+# Initialize services (singleton-style instances)
 qa_service = QAService()
+_speech_repository = FirestoreSpeechRepository()
+_speech_stats_service = SpeechStatsService(repository=_speech_repository)
 
 
 @router.post("/ask", response_model=AnswerResponse)
@@ -31,10 +48,106 @@ async def ask_question(request: QuestionRequest):
         AnswerResponse with the AI-generated answer
     """
     try:
-        result = qa_service.answer_question(request.question)
+        child_id = (request.child_id or LOGGED_IN_USER_UID).strip() or LOGGED_IN_USER_UID
+        result = qa_service.answer_question(
+            request.question,
+            child_id=child_id,
+        )
         return AnswerResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+
+
+@router.get("/speech-progress", response_model=SpeechStatsResponse)
+async def get_speech_progress(child_id: Optional[str] = None):
+    """
+    Get speech accuracy statistics for a child.
+
+    Currently uses a mock repository that simulates Firestore documents.
+    The repository is injected into the service so it can be swapped with
+    a real Firestore-backed implementation later without changing this
+    route or the frontend integration.
+    """
+    try:
+        return _speech_stats_service.get_stats(child_id=child_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error calculating speech progress: {str(e)}",
+        )
+
+
+@router.get("/child-summary", response_model=ChildSummaryResponse)
+async def get_child_summary(child_id: Optional[str] = None):
+    """
+    Get high-level child information and progress for the parent dashboard.
+
+    For now this uses the mock speech statistics and derives:
+    - overall accuracy
+    - strongest and weakest sound families
+    - a simple weekly improvement percentage
+    """
+    try:
+        stats = _speech_stats_service.get_stats(child_id=child_id)
+
+        # හොඳම ශේෂ්ඨත්වය / අවධානය දිය යුතු: request letter of highest/lowest accuracy session (set after we have child_id_value)
+        strongest_area = "N/A"
+        focus_area = "N/A"
+
+        # Child metadata from users/{resolved_uid}; default to logged-in user when child_id not sent
+        from parentdashboard.data.firebase_client import get_firestore_client
+
+        client = get_firestore_client()
+        child_id_value = child_id or LOGGED_IN_USER_UID
+        resolved_uid = _resolve_child_uid(child_id_value)
+        doc_ref = client.collection("users").document(resolved_uid or child_id_value)
+        doc = doc_ref.get()
+        raw = doc.to_dict() or {} if doc.exists else {}
+
+        name = raw.get("name", "Unknown Child")
+        age = int(raw.get("age", 0) or 0)
+
+        # නිවැරදි බව: total % correct from latest practice in each session, last 30 days (practice subcollection)
+        overall_accuracy = get_accuracy_from_latest_practice_per_session(child_id_value)
+        monthly_practice_count = get_monthly_practice_count(child_id_value)
+        target_sounds = get_target_sounds_last_4_sessions(child_id_value)
+        best_letter, focus_letter = get_best_and_focus_session_letters(child_id_value)
+        strongest_area = best_letter
+        focus_area = focus_letter
+
+        return ChildSummaryResponse(
+            id=child_id_value,
+            name=name,
+            age=age,
+            strongest_area=strongest_area,
+            focus_area=focus_area,
+            overall_accuracy=round(overall_accuracy, 2),
+            monthly_practice_count=monthly_practice_count,
+            target_sounds=target_sounds,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error calculating child summary: {str(e)}",
+        )
+
+
+@router.get("/child-stats/{child_id}")
+async def get_child_stats(child_id: str, user_id: Optional[str] = None):
+    """
+    Get high-level dashboard statistics for a specific child.
+
+    child_id is the child's Firebase UID (users/{child_id}/sessions/...).
+    user_id is optional and not used for the new Firestore path.
+    """
+    try:
+        stats = get_dashboard_stats(child_user_id=child_id)
+        return JSONResponse(content=stats)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error calculating child stats: {str(e)}",
+        )
 
 
 @router.post("/reload")
@@ -105,8 +218,8 @@ def process_pdf_background(filename: str):
 
 @router.post("/pdfs/upload")
 async def upload_pdf(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
 ):
     """
     Upload a PDF file to the knowledge base.

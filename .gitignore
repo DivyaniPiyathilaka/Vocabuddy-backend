@@ -46,3 +46,5 @@ run_therapy_only.py
 .DS_Store
 Thumbs.db
 
+
+serviceAccountKey.json

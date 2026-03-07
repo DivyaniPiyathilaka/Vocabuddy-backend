@@ -2,10 +2,12 @@
 QA Service module.
 Connects RAG pipeline with LLM to answer questions.
 """
-from typing import Dict
+from typing import Dict, Optional
+
 from parentdashboard.rag.rag_pipeline import RAGPipeline
 from parentdashboard.ai.llm import GroqLLM
 from parentdashboard.ai.prompt import build_prompt, get_system_prompt
+from parentdashboard.services.service import get_child_summary
 
 
 class QAService:
@@ -19,12 +21,13 @@ class QAService:
         # Initialize RAG pipeline
         self.rag_pipeline.initialize()
     
-    def answer_question(self, question: str) -> Dict[str, str]:
+    def answer_question(self, question: str, child_id: Optional[str] = None) -> Dict[str, str]:
         """
         Answer a question using RAG + LLM with Sinhala support.
         
         Args:
             question: User's question (can be in Sinhala or English)
+            child_id: Optional child identifier for personalized context
         
         Returns:
             Dictionary with 'answer' key containing the response
@@ -34,6 +37,25 @@ class QAService:
         
         # Build prompt (handles Sinhala/English detection and general knowledge supplementation)
         prompt = build_prompt(question, context_chunks)
+        
+        # Append personalized child summary if available
+        child_summary_text = ""
+        if child_id:
+            try:
+                summary = get_child_summary(child_id)
+                child_summary_text = f"\n\n[Child Summary]\n{summary}"
+            except Exception:
+                # Fail silently for personalization to avoid breaking core QA
+                child_summary_text = ""
+        
+        if child_summary_text:
+            prompt = (
+                f"{prompt}{child_summary_text}\n\n"
+                "When the question is about this child's progress, activities, or performance: "
+                "answer directly from the [Child Summary] above. Do NOT mention that this information "
+                "is not in the PDFs or knowledge base—simply give a clear, helpful answer based on the child's data."
+            )
+        
         system_prompt = get_system_prompt()
         
         # Generate answer
