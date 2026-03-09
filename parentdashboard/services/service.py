@@ -6,9 +6,15 @@ the mock implementation later without changing the FastAPI routes.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
+
+# In-memory cache for dashboard stats (charts): child_user_id -> (stats_dict, expiry_timestamp, last_activity_ts)
+# When serving from cache we re-check last_activity; if DB changed we invalidate so updated data is used.
+_dashboard_stats_cache: Dict[str, Tuple[Dict[str, Any], float, Optional[datetime]]] = {}
+_DASHBOARD_STATS_TTL_SECONDS = 90  # 1.5 minutes
 
 from parentdashboard.schemas.speech_stats import (
     PhonemeStat,
@@ -17,6 +23,7 @@ from parentdashboard.schemas.speech_stats import (
 )
 from parentdashboard.data.firebase_client import get_firestore_client
 from parentdashboard.services.weekly_chart import build_weekly_trend_with_dates_last_4_weeks
+from firebase_admin import firestore
 
 # Logged-in user's Firebase UID. Use for defaults when request does not send child_id.
 # Replace with auth context when login is wired.
@@ -35,6 +42,21 @@ def _resolve_child_uid(child_id: Optional[str]) -> str:
         return ""
     cid = child_id.strip()
     return CHILD_ID_TO_FIREBASE_UID.get(cid, cid)
+
+
+def _parse_firestore_datetime(value: Any) -> Optional[datetime]:
+    """Convert Firestore timestamp or datetime to timezone-aware UTC datetime."""
+    if value is None:
+        return None
+    if hasattr(value, "to_datetime"):
+        dt = value.to_datetime()
+    elif isinstance(value, datetime):
+        dt = value
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 class SpeechRecordRepository(Protocol):
@@ -270,7 +292,11 @@ def _get_attempts_from_session_ref(
 def _get_attempts_from_practice_ref(
     practice_doc: Any, session_date: Optional[datetime]
 ) -> List[Dict[str, Any]]:
-    """Get word attempts from a practice doc (attempts subcollection or word_progress on doc)."""
+    """Get word attempts from a practice doc (attempts subcollection or word_progress on doc).
+    Supports two Firestore shapes:
+    - attempt docs with word_progress array: [{"status": "success"|"wrong", "word": "..."}]
+    - attempt docs with top-level status and word (one attempt per doc)
+    """
     if session_date is None:
         return []
     result: List[Dict[str, Any]] = []
@@ -279,9 +305,21 @@ def _get_attempts_from_practice_ref(
     attempts_ref = practice_doc.reference.collection("attempts")
     for attempt_doc in attempts_ref.stream():
         attempt_data = attempt_doc.to_dict() or {}
-        if not word_progress:
-            word_progress = attempt_data.get("word_progress") or []
-        for item in word_progress:
+        # Shape 1: one attempt per doc with top-level status and word
+        status_top = (attempt_data.get("status") or "").strip().lower()
+        word_top = attempt_data.get("word")
+        if status_top in ("success", "wrong") and word_top is not None:
+            result.append(
+                {
+                    "word": str(word_top),
+                    "iscorrect": status_top == "success",
+                    "date": session_date,
+                }
+            )
+            continue
+        # Shape 2: attempt doc has word_progress array
+        wp = attempt_data.get("word_progress") or word_progress
+        for item in wp:
             if not isinstance(item, dict):
                 continue
             status = (item.get("status") or "").strip().lower()
@@ -337,15 +375,7 @@ def get_attempts_from_latest_practice_per_session(
     session_list: List[Tuple[datetime, Any]] = []
     for session_doc in session_docs:
         data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        session_dt: Optional[datetime] = None
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            elif isinstance(created_at, datetime):
-                session_dt = created_at
-            if session_dt is not None and session_dt.tzinfo is None:
-                session_dt = session_dt.replace(tzinfo=timezone.utc)
+        session_dt = _parse_firestore_datetime(data.get("created_at"))
         if session_dt is None:
             continue
         if cutoff_30_days <= session_dt <= now:
@@ -354,15 +384,7 @@ def get_attempts_from_latest_practice_per_session(
     result: List[Dict[str, Any]] = []
     for _dt, session_doc in session_list:
         data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        session_dt: Optional[datetime] = None
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            elif isinstance(created_at, datetime):
-                session_dt = created_at
-            if session_dt is not None and session_dt.tzinfo is None:
-                session_dt = session_dt.replace(tzinfo=timezone.utc)
+        session_dt = _parse_firestore_datetime(data.get("created_at"))
 
         practice_ref = session_doc.reference.collection("practice")
         practice_docs = list(practice_ref.stream())
@@ -371,17 +393,9 @@ def get_attempts_from_latest_practice_per_session(
             with_dates: List[Tuple[datetime, Any]] = []
             for pdoc in practice_docs:
                 pdata = pdoc.to_dict() or {}
-                p_created = pdata.get("created_at")
-                if p_created is None:
+                p_dt = _parse_firestore_datetime(pdata.get("created_at"))
+                if p_dt is None:
                     continue
-                if hasattr(p_created, "to_datetime"):
-                    p_dt = p_created.to_datetime()
-                elif isinstance(p_created, datetime):
-                    p_dt = p_created
-                else:
-                    continue
-                if p_dt.tzinfo is None:
-                    p_dt = p_dt.replace(tzinfo=timezone.utc)
                 with_dates.append((p_dt, pdoc))
             if with_dates:
                 with_dates.sort(key=lambda x: x[0], reverse=True)
@@ -434,15 +448,7 @@ def get_average_accuracy_per_session_last_30_days(child_user_id: str) -> float:
     session_list: List[Tuple[datetime, Any]] = []
     for session_doc in session_docs:
         data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        session_dt: Optional[datetime] = None
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            elif isinstance(created_at, datetime):
-                session_dt = created_at
-            if session_dt is not None and session_dt.tzinfo is None:
-                session_dt = session_dt.replace(tzinfo=timezone.utc)
+        session_dt = _parse_firestore_datetime(data.get("created_at"))
         if session_dt is None:
             continue
         if cutoff_30_days <= session_dt <= now:
@@ -450,7 +456,7 @@ def get_average_accuracy_per_session_last_30_days(child_user_id: str) -> float:
 
     if not session_list:
         return 0.0
-    accuracies = [_accuracy_from_session(session_doc.reference) for _dt, session_doc in session_list]
+    accuracies = [_accuracy_from_session(session_doc.reference)[0] for _dt, session_doc in session_list]
     return sum(accuracies) / len(accuracies) if accuracies else 0.0
 
 
@@ -469,32 +475,14 @@ def get_monthly_practice_count(child_user_id: str) -> int:
     count = 0
     for session_doc in sessions_ref.stream():
         data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            else:
-                session_dt = created_at if isinstance(created_at, datetime) else None
-            if session_dt is not None:
-                if session_dt.tzinfo is None:
-                    session_dt = session_dt.replace(tzinfo=timezone.utc)
-                if first_of_month <= session_dt <= now:
-                    count += 1
+        session_dt = _parse_firestore_datetime(data.get("created_at"))
+        if session_dt is not None and first_of_month <= session_dt <= now:
+            count += 1
         practice_ref = session_doc.reference.collection("practice")
         for practice_doc in practice_ref.stream():
             pdata = practice_doc.to_dict() or {}
-            p_created = pdata.get("created_at")
-            if p_created is None:
-                continue
-            if hasattr(p_created, "to_datetime"):
-                p_dt = p_created.to_datetime()
-            elif isinstance(p_created, datetime):
-                p_dt = p_created
-            else:
-                continue
-            if p_dt.tzinfo is None:
-                p_dt = p_dt.replace(tzinfo=timezone.utc)
-            if first_of_month <= p_dt <= now:
+            p_dt = _parse_firestore_datetime(pdata.get("created_at"))
+            if p_dt is not None and first_of_month <= p_dt <= now:
                 count += 1
     return count
 
@@ -514,32 +502,14 @@ def get_practice_count_last_7_days(child_user_id: str) -> int:
     count = 0
     for session_doc in sessions_ref.stream():
         data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            else:
-                session_dt = created_at if isinstance(created_at, datetime) else None
-            if session_dt is not None:
-                if session_dt.tzinfo is None:
-                    session_dt = session_dt.replace(tzinfo=timezone.utc)
-                if cutoff_7_days <= session_dt <= now:
-                    count += 1
+        session_dt = _parse_firestore_datetime(data.get("created_at"))
+        if session_dt is not None and cutoff_7_days <= session_dt <= now:
+            count += 1
         practice_ref = session_doc.reference.collection("practice")
         for practice_doc in practice_ref.stream():
             pdata = practice_doc.to_dict() or {}
-            p_created = pdata.get("created_at")
-            if p_created is None:
-                continue
-            if hasattr(p_created, "to_datetime"):
-                p_dt = p_created.to_datetime()
-            elif isinstance(p_created, datetime):
-                p_dt = p_created
-            else:
-                continue
-            if p_dt.tzinfo is None:
-                p_dt = p_dt.replace(tzinfo=timezone.utc)
-            if cutoff_7_days <= p_dt <= now:
+            p_dt = _parse_firestore_datetime(pdata.get("created_at"))
+            if p_dt is not None and cutoff_7_days <= p_dt <= now:
                 count += 1
     return count
 
@@ -559,73 +529,15 @@ def get_target_sounds_last_4_sessions(child_user_id: str) -> List[str]:
     session_infos: List[Tuple[datetime, str]] = []
     for session_doc in sessions_ref.stream():
         data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        request = data.get("request") or {}
-        letter = str(request.get("letter", "")).strip()
-        session_dt: Optional[datetime] = None
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            elif isinstance(created_at, datetime):
-                session_dt = created_at
-            if session_dt is not None and session_dt.tzinfo is None:
-                session_dt = session_dt.replace(tzinfo=timezone.utc)
+        session_dt = _parse_firestore_datetime(data.get("created_at"))
         if session_dt is None:
             continue
         if cutoff_30_days <= session_dt <= now:
+            request = data.get("request") or {}
+            letter = str(request.get("letter", "")).strip()
             session_infos.append((session_dt, letter))
     session_infos.sort(key=lambda x: x[0], reverse=True)
     return [letter for _dt, letter in session_infos]
-
-
-def get_best_and_focus_session_letters(
-    child_user_id: str,
-) -> Tuple[str, str]:
-    """
-    හොඳම ශේෂ්ඨත්වය / අවධානය දිය යුතු:
-    Return (request_letter of session with highest accuracy, request_letter of session with lowest accuracy).
-    Uses last 4 sessions by created_at. Returns ("N/A", "N/A") if no data.
-    """
-    child_user_id = _resolve_child_uid(child_user_id)
-    if not child_user_id:
-        return ("N/A", "N/A")
-
-    client = get_firestore_client()
-    sessions_ref = (
-        client.collection("users").document(child_user_id).collection("sessions")
-    )
-    session_infos: List[Tuple[datetime, Any, str]] = []
-    for session_doc in sessions_ref.stream():
-        data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        request = data.get("request") or {}
-        letter = str(request.get("letter", "")).strip() or "—"
-        session_dt: Optional[datetime] = None
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            elif isinstance(created_at, datetime):
-                session_dt = created_at
-            if session_dt is not None and session_dt.tzinfo is None:
-                session_dt = session_dt.replace(tzinfo=timezone.utc)
-        if session_dt is None:
-            continue
-        session_infos.append((session_dt, session_doc.reference, letter))
-    session_infos.sort(key=lambda x: x[0], reverse=True)
-    latest_four = session_infos[:4]
-    if not latest_four:
-        return ("N/A", "N/A")
-
-    with_accuracy: List[Tuple[str, float]] = []
-    for _dt, session_ref, letter in latest_four:
-        acc = _accuracy_from_session(session_ref)
-        with_accuracy.append((letter, acc))
-
-    if not with_accuracy:
-        return ("N/A", "N/A")
-    best_letter, _ = max(with_accuracy, key=lambda x: x[1])
-    focus_letter, _ = min(with_accuracy, key=lambda x: x[1])
-    return (best_letter, focus_letter)
 
 
 def get_child_performance_data(
@@ -666,37 +578,34 @@ def get_child_performance_data(
         practice_ref = session_doc.reference.collection("practice")
         for practice_doc in practice_ref.stream():
             practice_data = practice_doc.to_dict() or {}
-            created_at = practice_data.get("created_at")
-
-            session_date: Optional[datetime] = None
-            if created_at is not None:
-                if hasattr(created_at, "to_datetime"):
-                    session_date = created_at.to_datetime()
-                elif isinstance(created_at, datetime):
-                    session_date = created_at
-                if session_date is not None and session_date.tzinfo is None:
-                    session_date = session_date.replace(tzinfo=timezone.utc)
-
+            session_date = _parse_firestore_datetime(practice_data.get("created_at"))
             if session_date is None:
                 continue
 
             attempts_ref = practice_doc.reference.collection("attempts")
             for attempt_doc in attempts_ref.stream():
                 attempt_data = attempt_doc.to_dict() or {}
+                status_top = (attempt_data.get("status") or "").strip().lower()
+                if status_top in ("success", "wrong") and attempt_data.get("word") is not None:
+                    result.append(
+                        {
+                            "word": str(attempt_data.get("word", "")),
+                            "iscorrect": status_top == "success",
+                            "date": session_date,
+                        }
+                    )
+                    continue
                 word_progress = attempt_data.get("word_progress") or practice_data.get("word_progress") or []
-
                 for item in word_progress:
                     if not isinstance(item, dict):
                         continue
                     status = (item.get("status") or "").strip().lower()
                     if status not in ("success", "wrong"):
                         continue
-                    word_str = str(item.get("word", ""))
-                    iscorrect = status == "success"
                     result.append(
                         {
-                            "word": word_str,
-                            "iscorrect": iscorrect,
+                            "word": str(item.get("word", "")),
+                            "iscorrect": status == "success",
                             "date": session_date,
                         }
                     )
@@ -705,12 +614,18 @@ def get_child_performance_data(
 
 
 def _practice_accuracy_from_attempts(practice_doc_ref: Any) -> float:
-    """Compute accuracy from attempts' word_progress, or practice doc's word_progress if attempts have none."""
+    """Compute accuracy from attempts (word_progress array or top-level status/word per doc)."""
     total = 0
     correct = 0
     attempts_ref = practice_doc_ref.collection("attempts")
     for attempt_doc in attempts_ref.stream():
         data = attempt_doc.to_dict() or {}
+        status_top = (data.get("status") or "").strip().lower()
+        if status_top in ("success", "wrong"):
+            total += 1
+            if status_top == "success":
+                correct += 1
+            continue
         word_progress = data.get("word_progress") or []
         for item in word_progress:
             if not isinstance(item, dict):
@@ -722,12 +637,10 @@ def _practice_accuracy_from_attempts(practice_doc_ref: Any) -> float:
             elif status == "wrong":
                 total += 1
     if total == 0:
-        # Fallback: word_progress may be on the practice document
         practice_doc = practice_doc_ref.get()
         if practice_doc.exists:
             practice_data = practice_doc.to_dict() or {}
-            word_progress = practice_data.get("word_progress") or []
-            for item in word_progress:
+            for item in practice_data.get("word_progress") or []:
                 if not isinstance(item, dict):
                     continue
                 status = (item.get("status") or "").strip().lower()
@@ -739,11 +652,34 @@ def _practice_accuracy_from_attempts(practice_doc_ref: Any) -> float:
     return (correct / total * 100.0) if total > 0 else 0.0
 
 
-def _accuracy_from_session(session_ref: Any) -> float:
-    """Compute accuracy for a session doc. Tries 'objects' subcollection then 'practice' -> 'attempts'."""
+def _accuracy_from_session(session_ref: Any) -> Tuple[float, Optional[datetime]]:
+    """
+    Compute accuracy for a session doc. Tries 'practice' -> 'attempts' first (so we get
+    practice created_at for the label), then 'objects' if no practice data.
+    Returns (accuracy, date_for_label): date_for_label is the practice created_at when value
+    comes from a practice; None when from objects only.
+    """
+    # Try practice -> attempts first so we get the practice date for the chart label (same as value)
+    practice_ref = session_ref.collection("practice")
+    best_acc = 0.0
+    best_dt: Optional[datetime] = None
+    for practice_doc in practice_ref.stream():
+        pdata = practice_doc.to_dict() or {}
+        p_dt = _parse_firestore_datetime(
+            pdata.get("created_at") or pdata.get("createdAt")
+        )
+        p_acc = _practice_accuracy_from_attempts(practice_doc.reference)
+        if p_acc > 0:
+            if p_dt is not None and (best_dt is None or p_dt > best_dt):
+                best_acc = p_acc
+                best_dt = p_dt
+            elif best_dt is None and best_acc == 0.0:
+                best_acc = p_acc
+    if best_acc > 0:
+        return (best_acc, best_dt)
+    # Fallback: objects subcollection (no per-attempt date, caller will use session date)
     total = 0
     correct = 0
-    # Try objects subcollection (session-level structure: users/.../sessions/{id}/objects)
     objects_ref = session_ref.collection("objects")
     for obj_doc in objects_ref.stream():
         data = obj_doc.to_dict() or {}
@@ -759,21 +695,79 @@ def _accuracy_from_session(session_ref: Any) -> float:
                 elif status == "wrong":
                     total += 1
         else:
-            # Single status field on the object doc
             status = (data.get("status") or "").strip().lower()
             if status in ("success", "wrong"):
                 total += 1
                 if status == "success":
                     correct += 1
     if total > 0:
-        return (correct / total * 100.0)
-    # Fallback: practice -> attempts (nested structure under session)
-    practice_ref = session_ref.collection("practice")
-    for practice_doc in practice_ref.stream():
-        p_acc = _practice_accuracy_from_attempts(practice_doc.reference)
-        if p_acc > 0:
-            return p_acc
-    return 0.0
+        return (correct / total * 100.0, None)
+    return (0.0, None)
+
+
+def get_latest_activity_timestamp(child_user_id: str) -> Optional[datetime]:
+    """
+    One cheap Firestore read: latest session created_at for this child.
+    Used to invalidate cache when DB has new data (new session/practice) within TTL.
+    """
+    resolved = _resolve_child_uid(child_user_id) or child_user_id
+    if not resolved:
+        return None
+    try:
+        client = get_firestore_client()
+        sessions_ref = (
+            client.collection("users")
+            .document(resolved)
+            .collection("sessions")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(1)
+        )
+        for doc in sessions_ref.stream():
+            data = doc.to_dict() or {}
+            return _parse_firestore_datetime(data.get("created_at"))
+    except Exception:
+        return None
+    return None
+
+
+def _get_cached_dashboard_stats(child_user_id: str) -> Optional[Dict[str, Any]]:
+    """Return cached dashboard stats if present, not expired, and DB unchanged; otherwise None."""
+    now = time.time()
+    if child_user_id not in _dashboard_stats_cache:
+        return None
+    data, expiry, last_ts = _dashboard_stats_cache[child_user_id]
+    if now >= expiry:
+        del _dashboard_stats_cache[child_user_id]
+        return None
+    current_ts = get_latest_activity_timestamp(child_user_id)
+    if current_ts != last_ts:
+        del _dashboard_stats_cache[child_user_id]
+        return None
+    return data
+
+
+def _set_cached_dashboard_stats(
+    child_user_id: str, data: Dict[str, Any], last_activity_ts: Optional[datetime] = None
+) -> None:
+    """Store dashboard stats in cache with TTL and last-activity timestamp for validation."""
+    if last_activity_ts is None:
+        last_activity_ts = get_latest_activity_timestamp(child_user_id)
+    _dashboard_stats_cache[child_user_id] = (
+        data,
+        time.time() + _DASHBOARD_STATS_TTL_SECONDS,
+        last_activity_ts,
+    )
+
+
+def get_dashboard_stats_cached(child_user_id: str) -> Dict[str, Any]:
+    """Return dashboard stats for a child, using in-memory cache when valid and DB unchanged."""
+    resolved = _resolve_child_uid(child_user_id) or child_user_id
+    cached = _get_cached_dashboard_stats(resolved)
+    if cached is not None:
+        return cached
+    result = get_dashboard_stats(child_user_id)
+    _set_cached_dashboard_stats(resolved, result)
+    return result
 
 
 def get_dashboard_stats(child_user_id: str) -> Dict[str, Any]:
@@ -857,20 +851,12 @@ def get_dashboard_stats(child_user_id: str) -> Dict[str, Any]:
     session_infos: List[Tuple[datetime, Any, str]] = []
     for session_doc in session_docs:
         data = session_doc.to_dict() or {}
-        created_at = data.get("created_at")
-        request = data.get("request") or {}
-        letter = str(request.get("letter", "")).strip()
-        session_dt: Optional[datetime] = None
-        if created_at is not None:
-            if hasattr(created_at, "to_datetime"):
-                session_dt = created_at.to_datetime()
-            elif isinstance(created_at, datetime):
-                session_dt = created_at
-            if session_dt is not None and session_dt.tzinfo is None:
-                session_dt = session_dt.replace(tzinfo=timezone.utc)
+        session_dt = _parse_firestore_datetime(data.get("created_at"))
         if session_dt is None:
             continue
         if cutoff_30_days <= session_dt <= now_30:
+            request = data.get("request") or {}
+            letter = str(request.get("letter", "")).strip()
             session_infos.append((session_dt, session_doc.reference, letter))
 
     # Oldest first so the bar chart reads left-to-right chronologically
@@ -878,9 +864,10 @@ def get_dashboard_stats(child_user_id: str) -> Dict[str, Any]:
 
     word_category_progress: List[Dict[str, Any]] = []
     for session_dt, session_ref, letter in session_infos:
-        accuracy = _accuracy_from_session(session_ref)  # latest practice value for this session
-        label_date = session_dt.strftime("%d %b")  # e.g. "06 Mar"
-        # Bar chart label: request letter with date (letter from session doc request.letter)
+        accuracy, practice_dt = _accuracy_from_session(session_ref)
+        # Use the date of the practice that produced the value (last attempt), so label and value match
+        label_dt = practice_dt if practice_dt is not None else session_dt
+        label_date = label_dt.strftime("%d %b")  # e.g. "06 Mar"
         letter_part = letter or "—"
         label = f"{letter_part} ({label_date})"
         word_category_progress.append({"label": label, "value": round(accuracy, 2)})
@@ -910,7 +897,7 @@ def get_child_summary(child_id: str) -> str:
     stats = stats_service.get_stats(child_id=child_id)
     monthly_count = stats_service.get_monthly_session_count(child_id=child_id)
 
-    dashboard = get_dashboard_stats(child_user_id=child_id)
+    dashboard = get_dashboard_stats_cached(child_user_id=child_id)
     word_categories = dashboard.get("word_category_progress", [])
 
     recent_sessions_summary_lines = []

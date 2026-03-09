@@ -1,12 +1,17 @@
 """
 API routes for Parent Dashboard.
 """
+import logging
+import time
+from pathlib import Path
+import shutil
+from typing import Any, Dict, Optional, Tuple
+
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse
 from typing import List, Optional
-from pathlib import Path
-import os
-import shutil
+
+from parentdashboard.config import PDFS_DIR
 from parentdashboard.schemas.request import QuestionRequest, UpdatePdfRequest
 from parentdashboard.schemas.response import AnswerResponse
 from parentdashboard.schemas.speech_stats import (
@@ -17,15 +22,20 @@ from parentdashboard.services.qa_service import QAService
 from parentdashboard.services.service import (
     FirestoreSpeechRepository,
     SpeechStatsService,
-    get_dashboard_stats,
+    get_dashboard_stats_cached,
+    get_latest_activity_timestamp,
     _resolve_child_uid,
     LOGGED_IN_USER_UID,
     get_accuracy_from_latest_practice_per_session,
     get_monthly_practice_count,
     get_target_sounds_last_4_sessions,
-    get_best_and_focus_session_letters,
 )
-from parentdashboard.config import PDFS_DIR
+logger = logging.getLogger(__name__)
+
+# In-memory cache for /child-summary: child_id -> (response_dict, expiry_timestamp, last_activity_ts)
+# If DB is updated within TTL we invalidate so the next request uses updated data.
+_child_summary_response_cache: Dict[str, Tuple[Dict[str, Any], float, Any]] = {}
+_CHILD_SUMMARY_RESPONSE_TTL = 90  # seconds
 
 # Initialize router
 router = APIRouter(prefix="/parentdashboard", tags=["Parent Dashboard"])
@@ -81,24 +91,23 @@ async def get_speech_progress(child_id: Optional[str] = None):
 async def get_child_summary(child_id: Optional[str] = None):
     """
     Get high-level child information and progress for the parent dashboard.
-
-    For now this uses the mock speech statistics and derives:
-    - overall accuracy
-    - strongest and weakest sound families
-    - a simple weekly improvement percentage
+    Response is cached in memory for 90s to speed up repeat loads.
     """
     try:
-        stats = _speech_stats_service.get_stats(child_id=child_id)
-
-        # හොඳම ශේෂ්ඨත්වය / අවධානය දිය යුතු: request letter of highest/lowest accuracy session (set after we have child_id_value)
-        strongest_area = "N/A"
-        focus_area = "N/A"
+        child_id_value = child_id or LOGGED_IN_USER_UID
+        now = time.time()
+        if child_id_value in _child_summary_response_cache:
+            cached, expiry, last_ts = _child_summary_response_cache[child_id_value]
+            if now < expiry:
+                current_ts = get_latest_activity_timestamp(child_id_value)
+                if current_ts == last_ts:
+                    return ChildSummaryResponse(**cached)
+            del _child_summary_response_cache[child_id_value]
 
         # Child metadata from users/{resolved_uid}; default to logged-in user when child_id not sent
         from parentdashboard.data.firebase_client import get_firestore_client
 
         client = get_firestore_client()
-        child_id_value = child_id or LOGGED_IN_USER_UID
         resolved_uid = _resolve_child_uid(child_id_value)
         doc_ref = client.collection("users").document(resolved_uid or child_id_value)
         doc = doc_ref.get()
@@ -107,24 +116,25 @@ async def get_child_summary(child_id: Optional[str] = None):
         name = raw.get("name", "Unknown Child")
         age = int(raw.get("age", 0) or 0)
 
-        # නිවැරදි බව: total % correct from latest practice in each session, last 30 days (practice subcollection)
         overall_accuracy = get_accuracy_from_latest_practice_per_session(child_id_value)
         monthly_practice_count = get_monthly_practice_count(child_id_value)
         target_sounds = get_target_sounds_last_4_sessions(child_id_value)
-        best_letter, focus_letter = get_best_and_focus_session_letters(child_id_value)
-        strongest_area = best_letter
-        focus_area = focus_letter
 
-        return ChildSummaryResponse(
-            id=child_id_value,
-            name=name,
-            age=age,
-            strongest_area=strongest_area,
-            focus_area=focus_area,
-            overall_accuracy=round(overall_accuracy, 2),
-            monthly_practice_count=monthly_practice_count,
-            target_sounds=target_sounds,
+        response_data = {
+            "id": child_id_value,
+            "name": name,
+            "age": age,
+            "overall_accuracy": round(overall_accuracy, 2),
+            "monthly_practice_count": monthly_practice_count,
+            "target_sounds": target_sounds,
+        }
+        last_ts = get_latest_activity_timestamp(child_id_value)
+        _child_summary_response_cache[child_id_value] = (
+            response_data,
+            now + _CHILD_SUMMARY_RESPONSE_TTL,
+            last_ts,
         )
+        return ChildSummaryResponse(**response_data)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -141,7 +151,7 @@ async def get_child_stats(child_id: str, user_id: Optional[str] = None):
     user_id is optional and not used for the new Firestore path.
     """
     try:
-        stats = get_dashboard_stats(child_user_id=child_id)
+        stats = get_dashboard_stats_cached(child_user_id=child_id)
         return JSONResponse(content=stats)
     except Exception as e:
         raise HTTPException(
@@ -211,9 +221,9 @@ def process_pdf_background(filename: str):
     """
     try:
         result = qa_service.add_single_pdf(filename)
-        print(f"Background processing completed for {filename}: {result.get('status', 'completed')}")
+        logger.info("Background processing completed for %s: %s", filename, result.get("status", "completed"))
     except Exception as e:
-        print(f"Error processing PDF {filename} in background: {str(e)}")
+        logger.exception("Error processing PDF %s in background: %s", filename, e)
 
 
 @router.post("/pdfs/upload")
@@ -310,7 +320,7 @@ async def update_pdf_name(request: UpdatePdfRequest):
             qa_service.reload_knowledge_base()
         except Exception as reload_error:
             # Log error but don't fail the update
-            print(f"Warning: Failed to reload knowledge base after update: {str(reload_error)}")
+            logger.warning("Failed to reload knowledge base after update: %s", reload_error)
         
         return {
             "status": "PDF renamed successfully",
@@ -350,7 +360,7 @@ async def delete_pdf(file_name: str):
             qa_service.remove_single_pdf(file_name)
         except Exception as remove_error:
             # Log error but continue with file deletion
-            print(f"Warning: Failed to remove PDF from vector store: {str(remove_error)}")
+            logger.warning("Failed to remove PDF from vector store: %s", remove_error)
         
         # Delete file from disk
         file_path.unlink()
