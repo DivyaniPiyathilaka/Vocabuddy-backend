@@ -73,8 +73,6 @@ class ChildSummaryResponse(BaseModel):
     id: str = Field(..., description="Child identifier")
     name: str = Field(..., description="Child's display name")
     age: int = Field(..., description="Child's age in years")
-    strongest_area: str = Field(..., description="Human-readable strongest sound family")
-    focus_area: str = Field(..., description="Human-readable weakest sound family")
     overall_accuracy: float = Field(
         ...,
         description="Accuracy from latest practice in each session (නිවැරදි බව)",
@@ -94,8 +92,6 @@ class ChildSummaryResponse(BaseModel):
                 "id": "mock-child",
                 "name": "එමා ජොන්සන්",
                 "age": 7,
-                "strongest_area": "ස ශබ්ද",
-                "focus_area": "ක ශබ්ද",
                 "overall_accuracy": 78.0,
                 "monthly_practice_count": 12,
                 "target_sounds": ["s", "w", "cs", "ක"],

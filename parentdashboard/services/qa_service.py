@@ -2,12 +2,44 @@
 QA Service module.
 Connects RAG pipeline with LLM to answer questions.
 """
-from typing import Dict, Optional
+import time
+from typing import Dict, Optional, Tuple
 
 from parentdashboard.rag.rag_pipeline import RAGPipeline
 from parentdashboard.ai.llm import GroqLLM
 from parentdashboard.ai.prompt import build_prompt, get_system_prompt
-from parentdashboard.services.service import get_child_summary
+from parentdashboard.services.service import get_child_summary, get_latest_activity_timestamp
+
+# In-memory cache: child_id -> (summary_text, expiry_timestamp, last_activity_ts)
+# If DB is updated within TTL we invalidate so the AI uses updated data.
+_child_summary_cache: Dict[str, Tuple[str, float, Optional[object]]] = {}
+_CHILD_SUMMARY_TTL_SECONDS = 120  # 2 minutes
+
+
+def _get_cached_child_summary(child_id: str) -> Optional[str]:
+    """Return cached summary if present, not expired, and DB unchanged; otherwise None."""
+    now = time.time()
+    if child_id not in _child_summary_cache:
+        return None
+    summary, expiry, last_ts = _child_summary_cache[child_id]
+    if now >= expiry:
+        del _child_summary_cache[child_id]
+        return None
+    current_ts = get_latest_activity_timestamp(child_id)
+    if current_ts != last_ts:
+        del _child_summary_cache[child_id]
+        return None
+    return summary
+
+
+def _set_cached_child_summary(child_id: str, summary: str) -> None:
+    """Store summary in cache with TTL and last-activity ts for validation."""
+    last_ts = get_latest_activity_timestamp(child_id)
+    _child_summary_cache[child_id] = (
+        summary,
+        time.time() + _CHILD_SUMMARY_TTL_SECONDS,
+        last_ts,
+    )
 
 
 class QAService:
@@ -38,11 +70,14 @@ class QAService:
         # Build prompt (handles Sinhala/English detection and general knowledge supplementation)
         prompt = build_prompt(question, context_chunks)
         
-        # Append personalized child summary if available
+        # Append personalized child summary if available (use in-memory cache to avoid repeated Firestore work)
         child_summary_text = ""
         if child_id:
             try:
-                summary = get_child_summary(child_id)
+                summary = _get_cached_child_summary(child_id)
+                if summary is None:
+                    summary = get_child_summary(child_id)
+                    _set_cached_child_summary(child_id, summary)
                 child_summary_text = f"\n\n[Child Summary]\n{summary}"
             except Exception:
                 # Fail silently for personalization to avoid breaking core QA
