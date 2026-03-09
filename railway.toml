@@ -1,0 +1,5 @@
+[build]
+timeout = 1200  # Increase timeout to 10 minutes (600 seconds)
+
+[deploy]
+timeout = 600 
